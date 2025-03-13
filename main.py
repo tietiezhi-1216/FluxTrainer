@@ -6,9 +6,10 @@ import signal
 import sys
 import json
 import traceback
-import app
 from gradio_client import Client, handle_file
-import random
+from minio import Minio
+from minio.error import S3Error
+import requests
 
 QUEUE_NAME = "task_queue"
 RABBITMQ_URL = "amqp://admin:admin@192.168.2.133"
@@ -16,7 +17,7 @@ DLX_EXCHANGE = "dlx_exchange"
 DLX_QUEUE = "dlx_queue"
 
 
-# 1️⃣ 连接 RabbitMQ 的函数（带重试）
+# 连接 RabbitMQ 的函数（带重试）
 def connect():
     while True:
         try:
@@ -29,7 +30,7 @@ def connect():
             time.sleep(5)  # 5 秒后重试
 
 
-# 2️⃣ 启动 RabbitMQ 消费者
+# 启动 RabbitMQ 消费者
 def connectRabbitmq():
     while True:  # 断线后自动重连
         try:
@@ -123,7 +124,6 @@ def consumeAndTrain(config):
 
     # 加载标注
     print("*************************加载标注*************************")
-    print(config["uploaded_files"])
     client.predict(
         uploaded_files=[handle_file(file) for file in config["uploaded_files"]],
         concept_sentence=config["lora_name"],
@@ -410,27 +410,67 @@ def consumeAndTrain(config):
         api_name="/start_training",
     )
 
-    return check_lora_safetensors(config["lora_name"])
+    return check_lora_safetensors(config)
 
 
-def check_lora_safetensors(lora_name):
+def check_lora_safetensors(config):
+    lora_name = config["lora_name"]
+    minio_address = config["minio_address"]
+    minio_access_key = config["minio_access_key"]
+    minio_secret_key = config["minio_secret_key"]
+    minio_bucket = config["minio_bucket"]
+    task_id = config["task_id"]
+
+    # MinIO 配置
+    minio_client = Minio(
+        minio_address,
+        access_key=minio_access_key,
+        secret_key=minio_secret_key,
+        secure=False,
+    )
+
     # 构造文件夹路径
-    folder_path = os.path.join("output", lora_name)
-
-    # 构造 safetensors 文件路径
+    folder_path = os.path.join("outputs", lora_name)
     safetensors_file = os.path.join(folder_path, f"{lora_name}.safetensors")
 
-    # 检查文件夹是否存在
-    if os.path.isdir(folder_path):
-        # 检查 safetensors 文件是否存在
-        if os.path.isfile(safetensors_file):
-            print(f"✅ 文件 {safetensors_file} 存在")
-            return True
-        else:
-            print(f"❌ 文件 {safetensors_file} 不存在")
-            return False
-    else:
+    # 检查文件夹和文件是否存在
+    if not os.path.isdir(folder_path):
         print(f"❌ 文件夹 {folder_path} 不存在")
+        return False
+
+    if not os.path.isfile(safetensors_file):
+        print(f"❌ 文件 {safetensors_file} 不存在")
+        return False
+
+    print(f"✅ 文件 {safetensors_file} 存在，准备上传...")
+
+    try:
+        # 确保存储桶存在
+        if not minio_client.bucket_exists(minio_bucket):
+            minio_client.make_bucket(minio_bucket)
+            print(f"✅ 存储桶 {minio_bucket} 已创建")
+
+        # 上传文件
+        object_name = f"{lora_name}.safetensors"
+        minio_client.fput_object(minio_bucket, object_name, safetensors_file)
+        print(
+            f"✅ 文件 {safetensors_file} 成功上传到 MinIO {minio_bucket}/{object_name}"
+        )
+
+        # 上传成功后，发送 GET 请求
+        lora_url = f"http://{minio_address}/{minio_bucket}/{object_name}"
+        params = {"task_id": task_id, "lora_url": lora_url}
+        response = requests.get("http://192.168.2.133:1015/callback", params=params)
+
+        if response.status_code == 204:
+            print(f"✅ 任务 {task_id} 回调请求成功")
+        else:
+            print(f"❌ 任务 {task_id} 回调请求失败，状态码: {response.status_code}")
+            return False
+
+        return True
+    except S3Error as e:
+        print(f"❌ 上传失败: {e}")
         return False
 
 
